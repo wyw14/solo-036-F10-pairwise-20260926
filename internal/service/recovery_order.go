@@ -22,6 +22,14 @@ type RecoveryStep struct {
 	Completed bool            `json:"completed"`
 }
 
+var canonicalRecoveryOrder = []RecoveryStage{
+	RecoveryJournal,
+	RecoveryRuns,
+	RecoveryRoutes,
+	RecoveryPermits,
+	RecoveryPressure,
+}
+
 type RecoveryPlan struct {
 	steps map[RecoveryStage]RecoveryStep
 }
@@ -115,7 +123,7 @@ func ValidateRecoveryOrdering() error {
 	if err := plan.Validate(); err != nil {
 		return err
 	}
-	for _, stage := range []RecoveryStage{RecoveryJournal, RecoveryRuns, RecoveryRoutes, RecoveryPermits, RecoveryPressure} {
+	for _, stage := range canonicalRecoveryOrder {
 		if !plan.Ready(stage) {
 			return fmt.Errorf("recovery stage %s is not ready in canonical order", stage)
 		}

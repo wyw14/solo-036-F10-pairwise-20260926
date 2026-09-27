@@ -557,15 +557,16 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	if control.Persistent == nil {
 		return RecoveryReport{Ready: true}, nil
 	}
-	snapshot, err := control.Persistent.ReadSnapshot()
-	if err != nil {
-		return RecoveryReport{}, err
+	// Re-read the same batch of evidence the dry run evaluates: the pinned
+	// snapshot plus the journal it references. Nothing has been mutated yet,
+	// so a blocked plan leaves the runtime exactly as it was.
+	evidence := readRecoveryEvidence(control.Persistent)
+	plan := PlanRecovery(evidence)
+	if !plan.Ready {
+		return RecoveryReport{}, fmt.Errorf("persistent recovery blocked at %s stage: %s", plan.BlockedAt, plan.Blocker())
 	}
-	if err := snapshot.Control.Validate(); err != nil {
-		return RecoveryReport{}, err
-	}
-	run.Restore(r.Runs, snapshot.Control.Runs)
-	leasing := make([]model.RouteLease, 0)
+	snapshot := evidence.Snapshot
+	leasing := make([]model.RouteLease, 0, len(plan.Routes))
 	for _, routeState := range snapshot.Control.Routes {
 		if routeState.Reserved {
 			leasing = append(leasing, model.RouteLease{
@@ -576,8 +577,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 			})
 		}
 	}
-	route.Restore(r.Routes, leasing)
-	permitEvents := make([]model.Event, 0)
+	permitEvents := make([]model.Event, 0, len(plan.Permits))
 	for _, permitState := range snapshot.Control.Permits {
 		if permitState.Granted {
 			permitEvents = append(permitEvents, model.Event{
@@ -589,8 +589,14 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 			})
 		}
 	}
-	permit.Restore(r.Permits, permitEvents)
+	// Publish: every fallible step (evidence reads, validation, preflight)
+	// happened above, so the swap below cannot fail and no half-recovered
+	// state is observable under the runtime lock.
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	run.Restore(r.Runs, snapshot.Control.Runs)
+	route.Restore(r.Routes, leasing)
+	permit.Restore(r.Permits, permitEvents)
 	r.control.Stations = snapshot.Control.StationIndex()
 	r.control.Routes = make(map[string]model.RouteState)
 	r.control.Valves = make(map[string]model.ValveState)
@@ -618,16 +624,11 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	}
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
-	r.mu.Unlock()
-	events, err := control.Persistent.Events()
-	if err != nil {
-		return RecoveryReport{}, err
-	}
 	return RecoveryReport{
-		RecoveredRuns:    len(snapshot.Control.Runs),
-		RecoveredRoutes:  len(leasing),
-		RecoveredPermits: len(permitEvents),
-		JournalEvents:    len(events),
+		RecoveredRuns:    len(plan.Runs),
+		RecoveredRoutes:  len(plan.Routes),
+		RecoveredPermits: len(plan.Permits),
+		JournalEvents:    evidence.JournalEvents,
 		Ready:            true,
 	}, nil
 }

@@ -16,6 +16,10 @@ func (h *Handler) PersistSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "persisted"})
 }
 
+func (h *Handler) RecoveryDryRun(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.runtime.DryRunRecovery())
+}
+
 func (h *Handler) RecoveryBarrier(w http.ResponseWriter, r *http.Request) {
 	timeout := 2 * time.Second
 	if value := r.URL.Query().Get("timeout_ms"); value != "" {
