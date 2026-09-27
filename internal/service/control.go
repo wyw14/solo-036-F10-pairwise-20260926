@@ -53,11 +53,12 @@ type ReceiveRequest struct {
 }
 
 type RecoveryReport struct {
-	RecoveredRuns    int  `json:"recovered_runs"`
-	RecoveredRoutes  int  `json:"recovered_routes"`
-	RecoveredPermits int  `json:"recovered_permits"`
-	JournalEvents    int  `json:"journal_events"`
-	Ready            bool `json:"ready"`
+	RecoveredRuns    int                    `json:"recovered_runs"`
+	RecoveredRoutes  int                    `json:"recovered_routes"`
+	RecoveredPermits int                    `json:"recovered_permits"`
+	JournalEvents    int                    `json:"journal_events"`
+	Ready            bool                   `json:"ready"`
+	Stages           []RecoveryStageFinding `json:"stages,omitempty"`
 }
 
 func defaultControlState() *ControlState {
@@ -552,23 +553,75 @@ func (r *Runtime) PersistSnapshot() error {
 	return control.Persistent.WriteSnapshot(snapshot)
 }
 
+// RecoverPersistent restores runtime state from the durable snapshot. The
+// evidence (snapshot + full event journal) is re-read from disk on every call
+// — conclusions from DryRunRecovery are never reused — and validated by the
+// same analyzeRecoveryEvidence rules the dry run reports on. If any recovery
+// stage is blocked, nothing is published. The publish itself is staged: all
+// new state is assembled first, swapped in via infallible ReplaceAll
+// operations, and verified by RecoveryBarrier afterwards; a failed post-check
+// rolls the pre-recovery state back in so a half-recovered state is never
+// visible.
 func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	control := r.ensureControl()
-	if control.Persistent == nil {
+	r.mu.Lock()
+	persistent := control.Persistent
+	r.mu.Unlock()
+	if persistent == nil {
 		return RecoveryReport{Ready: true}, nil
 	}
-	snapshot, err := control.Persistent.ReadSnapshot()
+	snapshot, err := persistent.ReadSnapshot()
 	if err != nil {
 		return RecoveryReport{}, err
 	}
-	if err := snapshot.Control.Validate(); err != nil {
+	events, err := persistent.Events()
+	if err != nil {
+		return RecoveryReport{}, fmt.Errorf("read event journal: %w", err)
+	}
+
+	evidence := analyzeRecoveryEvidence(snapshot, events)
+	if !evidence.Ready() {
+		stage, _ := evidence.BlockedAt()
+		return RecoveryReport{Stages: evidence.Stages}, fmt.Errorf(
+			"recovery blocked at stage %s: snapshot evidence does not satisfy recovery requirements", stage)
+	}
+
+	// Drive the canonical stage order so a future stage addition cannot
+	// silently bypass the journal → runs → routes → permits → pressure chain.
+	plan := NewRecoveryPlan()
+	if err := plan.Validate(); err != nil {
 		return RecoveryReport{}, err
 	}
-	run.Restore(r.Runs, snapshot.Control.Runs)
-	leasing := make([]model.RouteLease, 0)
+	for _, stage := range []RecoveryStage{RecoveryJournal, RecoveryRuns, RecoveryRoutes, RecoveryPermits, RecoveryPressure} {
+		if !plan.Ready(stage) {
+			return RecoveryReport{}, fmt.Errorf("recovery stage %s is not ready in canonical order", stage)
+		}
+		if err := plan.Complete(stage); err != nil {
+			return RecoveryReport{}, err
+		}
+	}
+
+	// Assemble the full recovered state from the validated evidence. Ready()
+	// guarantees every snapshot run and reserved lease passed its checks, so
+	// filtering by the evidence lists preserves full records safely.
+	runIDs := make(map[string]bool, len(evidence.Runs))
+	for _, recovered := range evidence.Runs {
+		runIDs[recovered.ID] = true
+	}
+	runs := make([]model.Run, 0, len(evidence.Runs))
+	for _, recorded := range snapshot.Control.Runs {
+		if runIDs[recorded.ID] {
+			runs = append(runs, recorded)
+		}
+	}
+	routeIDs := make(map[string]bool, len(evidence.Routes))
+	for _, recovered := range evidence.Routes {
+		routeIDs[recovered.ID] = true
+	}
+	leases := make([]model.RouteLease, 0, len(evidence.Routes))
 	for _, routeState := range snapshot.Control.Routes {
-		if routeState.Reserved {
-			leasing = append(leasing, model.RouteLease{
+		if routeState.Reserved && routeIDs[routeState.ID] {
+			leases = append(leases, model.RouteLease{
 				Route:      routeState.ID,
 				RunID:      routeState.RunID,
 				Epoch:      routeState.LeaseEpoch,
@@ -576,28 +629,44 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 			})
 		}
 	}
-	route.Restore(r.Routes, leasing)
-	permitEvents := make([]model.Event, 0)
-	for _, permitState := range snapshot.Control.Permits {
-		if permitState.Granted {
-			permitEvents = append(permitEvents, model.Event{
-				RunID:   permitState.RunID,
-				Kind:    "passage",
-				Epoch:   permitState.Generation,
-				Payload: permitState.Reason,
-				Durable: true,
-			})
-		}
+	permitEvents := make([]model.Event, 0, len(evidence.Permits))
+	for _, granted := range evidence.Permits {
+		permitEvents = append(permitEvents, model.Event{
+			RunID:   granted.RunID,
+			Kind:    "passage",
+			Epoch:   granted.Generation,
+			Payload: "recovered durable passage",
+			Durable: true,
+		})
 	}
-	permit.Restore(r.Permits, permitEvents)
+
+	// Capture the pre-recovery state for rollback. All of these are copies.
+	priorRuns := r.Runs.Snapshot()
+	priorLeases := route.Snapshot(r.Routes)
+	priorPermits := r.Permits.SnapshotEvents()
 	r.mu.Lock()
-	r.control.Stations = snapshot.Control.StationIndex()
-	r.control.Routes = make(map[string]model.RouteState)
-	r.control.Valves = make(map[string]model.ValveState)
-	r.control.Closures = make(map[string]model.ClosureState)
-	r.control.Pressures = make(map[string]model.PressureState)
-	r.control.Tracking = make(map[string][]model.TrackingState)
-	r.control.Permits = make(map[string][]model.PermitState)
+	priorControl := r.control
+	r.mu.Unlock()
+
+	// Publish. Every operation below is infallible, so the swap cannot stop
+	// halfway; the barrier check afterwards validates the combined result.
+	r.Runs.ReplaceAll(runs)
+	r.Routes.ReplaceAll(leases)
+	r.Permits.ReplaceAll(permitEvents)
+	r.mu.Lock()
+	r.control = &ControlState{
+		Network:    priorControl.Network,
+		Stations:   snapshot.Control.StationIndex(),
+		Routes:     make(map[string]model.RouteState),
+		Valves:     make(map[string]model.ValveState),
+		Closures:   make(map[string]model.ClosureState),
+		Pressures:  make(map[string]model.PressureState),
+		Tracking:   make(map[string][]model.TrackingState),
+		Permits:    make(map[string][]model.PermitState),
+		Incidents:  append([]model.Incident(nil), snapshot.Control.Incidents...),
+		Revision:   model.NewRevision(),
+		Persistent: persistent,
+	}
 	for _, value := range snapshot.Control.Routes {
 		r.control.Routes[value.ID] = value
 	}
@@ -616,19 +685,27 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	for _, value := range snapshot.Control.Permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
 	}
-	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
-	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
-	events, err := control.Persistent.Events()
-	if err != nil {
-		return RecoveryReport{}, err
+
+	if err := r.validateRecoveredState(); err != nil {
+		// Roll the pre-recovery state back in; never leave a half-recovered
+		// runtime visible to operators.
+		r.Runs.ReplaceAll(priorRuns)
+		r.Routes.ReplaceAll(priorLeases)
+		r.Permits.ReplaceAll(priorPermits)
+		r.mu.Lock()
+		r.control = priorControl
+		r.mu.Unlock()
+		return RecoveryReport{Stages: evidence.Stages}, fmt.Errorf("recovery post-check failed, rolled back: %w", err)
 	}
+
 	return RecoveryReport{
-		RecoveredRuns:    len(snapshot.Control.Runs),
-		RecoveredRoutes:  len(leasing),
+		RecoveredRuns:    len(runs),
+		RecoveredRoutes:  len(leases),
 		RecoveredPermits: len(permitEvents),
 		JournalEvents:    len(events),
 		Ready:            true,
+		Stages:           evidence.Stages,
 	}, nil
 }
 

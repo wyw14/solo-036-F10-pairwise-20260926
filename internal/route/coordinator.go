@@ -24,3 +24,25 @@ func (c *Coordinator) Release(route, runID string) {
 		delete(c.progress, runID)
 	}
 }
+
+// ReplaceAll swaps the full set of route leases in one critical section and
+// drops any route progress that does not belong to a surviving owner, so
+// recovery publishes a consistent lease table rather than incrementally
+// mutating the live one.
+func (c *Coordinator) ReplaceAll(leases []model.RouteLease) {
+	owners := make(map[string]model.RouteLease, len(leases))
+	progress := make(map[string]float64, len(leases))
+	c.mu.Lock()
+	for _, lease := range leases {
+		if lease.Route == "" || lease.RunID == "" {
+			continue
+		}
+		owners[lease.Route] = lease
+		if value, ok := c.progress[lease.RunID]; ok {
+			progress[lease.RunID] = value
+		}
+	}
+	c.owners = owners
+	c.progress = progress
+	c.mu.Unlock()
+}

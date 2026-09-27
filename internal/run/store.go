@@ -63,3 +63,17 @@ func (s *Store) Snapshot() []model.Run {
 	}
 	return out
 }
+
+// ReplaceAll swaps the entire contents of the store in a single critical
+// section. Recovery uses it to publish a fully assembled state instead of
+// mutating run by run, which could leave a partially recovered store visible if
+// a later recovery stage fails.
+func (s *Store) ReplaceAll(runs []model.Run) {
+	next := make(map[string]model.Run, len(runs))
+	for _, r := range runs {
+		next[r.ID] = r
+	}
+	s.mu.Lock()
+	s.runs = next
+	s.mu.Unlock()
+}

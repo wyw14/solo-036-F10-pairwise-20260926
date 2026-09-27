@@ -18,8 +18,22 @@ func (r *Runtime) RecoveryBarrier() error {
 	if !r.JournalHealthy() {
 		return errors.New("journal is not healthy")
 	}
+	return r.validateRecoveredState()
+}
+
+// validateRecoveredState checks the state invariants that must hold after a
+// recovery publish: every route lease is fenced by a live, non-terminal run,
+// and no operation sits in depressurization while pressure remains. It is the
+// in-memory counterpart of analyzeRecoveryEvidence's route/pressure stages and
+// deliberately does not require the in-memory journal to be populated: during
+// recovery the durable journal is verified directly, before any publish.
+func (r *Runtime) validateRecoveredState() error {
+	runs := make(map[string]model.Run)
+	for _, recorded := range r.Runs.Snapshot() {
+		runs[recorded.ID] = recorded
+	}
 	for _, lease := range route.Snapshot(r.Routes) {
-		current, ok := r.Runs.Get(lease.RunID)
+		current, ok := runs[lease.RunID]
 		if !ok {
 			return fmt.Errorf("route %s references missing run %s", lease.Route, lease.RunID)
 		}

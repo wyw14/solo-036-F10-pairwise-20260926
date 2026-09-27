@@ -26,6 +26,7 @@ func NewRouter(runtime *service.Runtime) http.Handler {
 		r.Get("/snapshot", h.Snapshot)
 		r.Post("/snapshot", h.PersistSnapshot)
 		r.Get("/recovery/barrier", h.RecoveryBarrier)
+		r.Get("/recovery/dry-run", h.RecoveryDryRun)
 	})
 	return router
 }

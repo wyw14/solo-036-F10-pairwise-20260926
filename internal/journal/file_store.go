@@ -206,10 +206,45 @@ func (s *FileStore) WriteSnapshot(control model.ControlSnapshot) error {
 	return nil
 }
 
-func (s *FileStore) ReadSnapshot() (FileSnapshot, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	file, err := os.Open(s.snapshotPath)
+func (s *FileStore) SnapshotPath() string { return s.snapshotPath }
+
+// ResolveSnapshotPath maps a caller-provided snapshot reference to an absolute
+// path inside the journal directory. An empty reference selects the canonical
+// snapshot. References that escape the journal directory (absolute paths or
+// ".." traversal) are rejected so a dry run can never read files outside the
+// configured data directory.
+func (s *FileStore) ResolveSnapshotPath(reference string) (string, error) {
+	if strings.TrimSpace(reference) == "" {
+		return s.snapshotPath, nil
+	}
+	if filepath.IsAbs(reference) {
+		cleaned := filepath.Clean(reference)
+		if !isWithin(s.directory, cleaned) {
+			return "", fmt.Errorf("snapshot %q is outside journal directory", reference)
+		}
+		return cleaned, nil
+	}
+	cleaned := filepath.Clean(filepath.Join(s.directory, reference))
+	if !isWithin(s.directory, cleaned) {
+		return "", fmt.Errorf("snapshot %q escapes journal directory", reference)
+	}
+	return cleaned, nil
+}
+
+func isWithin(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// DecodeSnapshot reads, decodes and structurally validates a snapshot file
+// without touching runtime journal state. It deliberately does not compare the
+// snapshot tail against the on-disk log, so a read-only dry run can inspect a
+// snapshot even before it becomes recoverable. The file is opened read-only.
+func (s *FileStore) DecodeSnapshot(path string) (FileSnapshot, error) {
+	file, err := os.Open(path)
 	if err != nil {
 		return FileSnapshot{}, fmt.Errorf("open snapshot: %w", err)
 	}
@@ -223,11 +258,21 @@ func (s *FileStore) ReadSnapshot() (FileSnapshot, error) {
 	if snapshot.Version != 1 {
 		return FileSnapshot{}, fmt.Errorf("unsupported snapshot version %d", snapshot.Version)
 	}
+	if err := snapshot.Control.Validate(); err != nil {
+		return FileSnapshot{}, fmt.Errorf("validate snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (s *FileStore) ReadSnapshot() (FileSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, err := s.DecodeSnapshot(s.snapshotPath)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
 	if snapshot.LastSequence > s.sequence {
 		return FileSnapshot{}, errors.New("snapshot references unavailable events")
-	}
-	if err := snapshot.Control.Validate(); err != nil {
-		return FileSnapshot{}, fmt.Errorf("validate restored snapshot: %w", err)
 	}
 	return snapshot, nil
 }
